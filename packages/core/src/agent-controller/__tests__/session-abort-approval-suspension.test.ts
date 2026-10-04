@@ -114,7 +114,7 @@ async function createHarness(id: string, durable: boolean) {
   const session = await controller.createSession({ id: `${id}-session`, ownerId: 'owner-1' });
   await session.thread.create();
 
-  return { controller, session, agent: registeredAgent, events: [] as AgentControllerEvent[] };
+  return { controller, session, agent: registeredAgent, mastra, storage, events: [] as AgentControllerEvent[] };
 }
 
 function waitForAgentEnd(session: any, events: AgentControllerEvent[]) {
@@ -232,6 +232,47 @@ describe.each([false, true])('session.abort() during approval / suspension (#205
       approval: { approved: false, reason: 'Aborted by the user' },
     });
   });
+
+  it.skipIf(durable)(
+    'Given a run parked in suspend(), When abort() settles it, Then the run is released and no longer listed as suspended (#25903)',
+    async () => {
+      const { controller, session, agent, storage, events } = await createHarness('abort-release', durable);
+      const mastra = controller.getMastra()!;
+
+      session.subscribe((event: AgentControllerEvent) => {
+        events.push(event);
+        if (event.type === 'tool_approval_required') {
+          void session.respondToToolApproval({ decision: 'approve', toolCallId: event.toolCallId });
+        }
+      });
+      const sending = session.sendMessage({ content: 'find dero' });
+      const workflowsStore = (await storage.getStore('workflows'))!;
+      let runId = '';
+      await vi.waitFor(
+        async () => {
+          const parked = (await agent.listSuspendedRuns({})).runs;
+          const run = parked.find(candidate =>
+            candidate.toolCalls.some(tool => tool.toolCallId === 'call-1' && !tool.requiresApproval),
+          );
+          expect(run).toBeDefined();
+          runId = run!.runId;
+        },
+        { timeout: 5000 },
+      );
+      expect((await workflowsStore.listWorkflowRuns({})).runs.map(run => run.workflowName).sort()).toEqual([
+        'agentic-loop',
+        'executionWorkflow',
+      ]);
+      expect(mastra.__hasInternalWorkflow('agentic-loop', runId)).toBe(true);
+
+      session.abort();
+      await sending;
+
+      await vi.waitFor(async () => expect((await workflowsStore.listWorkflowRuns({})).runs).toEqual([]));
+      expect((await agent.listSuspendedRuns({})).runs).toEqual([]);
+      expect(mastra.__hasInternalWorkflow('agentic-loop', runId)).toBe(false);
+    },
+  );
 
   it('Given an approval gate and a retained suspended tool, When abort() is called, Then both tool calls are denied before teardown', async () => {
     const { controller, session, events } = await createHarness('abort-approval-and-suspension', durable);

@@ -279,6 +279,14 @@ export interface ThreadDataStore {
   getModeIds(): string[];
 }
 
+/** Captured when an abort parks its teardown behind a denial, and claimed by the run engine. */
+interface DeferredAbortOrigin {
+  bindingGeneration: number;
+  localOnly: boolean;
+  /** Runs whose parked suspensions this abort denied; released once the abort completes. */
+  suspendedRunIds: string[];
+}
+
 /**
  * The AgentController-owned machinery a Session leverages to drive an agent run. In the
  * multi-user host one AgentController serves many sessions; the run loop, run state, and
@@ -298,6 +306,11 @@ export interface SessionMachinery {
   getAgent(): Agent;
   /** Get the ephemeral state associated with an active or suspended run. */
   getRunScope(runId: string): RunScope | undefined;
+  /**
+   * Drop the registration and workflow snapshot rows of a suspended run that
+   * will never be resumed (its parked tool calls were denied by an abort).
+   */
+  releaseSuspendedRun(runId: string): Promise<void>;
   /** Open a fresh subscription to a thread's agent event stream. */
   subscribeToThread(input: {
     agent?: Agent;
@@ -3229,7 +3242,7 @@ export class Session<TState = unknown> {
   #tokenUsage: TokenUsage = createEmptyTokenUsage();
   /** Whether the in-flight abort teardown must stay local to this process. */
   #localOnlyAbort = false;
-  #deferredAbortOrigin: { bindingGeneration: number; localOnly: boolean } | undefined;
+  #deferredAbortOrigin: DeferredAbortOrigin | undefined;
   /** Thread-settings persistence handle, injected by the AgentController via {@link setStore}. */
   #store: ThreadSettingsStore | undefined;
   /** Resolves a tool name to its category, injected by the AgentController via {@link setCategoryResolver} (the category map is AgentController config). */
@@ -3585,6 +3598,7 @@ export class Session<TState = unknown> {
     // left the UI rendering `ask_user` / `request_access` prompts whose answers
     // could never land, since the run they belong to is gone.
     const suspendedToolCalls = this.suspensions.clear();
+    const abandonedRunIds = [...new Set(suspendedToolCalls.map(suspension => suspension.runId))];
     for (const { toolCallId, toolName } of suspendedToolCalls) {
       this.emit({ type: 'tool_suspension_cancelled', toolCallId, toolName, reason: ABORTED_BY_USER_REASON });
     }
@@ -3608,7 +3622,11 @@ export class Session<TState = unknown> {
       this.run.requestAbort({ deferSignal: true });
       // The engine completes this teardown after its decline await; a rebind can
       // start a successor run in that window, so bind it to this binding too.
-      this.#deferredAbortOrigin = { bindingGeneration: this.run.bindingGeneration(), localOnly: this.#localOnlyAbort };
+      this.#deferredAbortOrigin = {
+        bindingGeneration: this.run.bindingGeneration(),
+        localOnly: this.#localOnlyAbort,
+        suspendedRunIds: abandonedRunIds,
+      };
       if (suspendedToolCalls.length === 0) {
         this.#releaseApprovalGates({ threadId: abortThreadId });
         return;
@@ -3625,7 +3643,11 @@ export class Session<TState = unknown> {
       // Settlement is async; a thread switch / `/new` can tear down the binding
       // and start a successor run before it lands. Bind the teardown to this
       // binding and abort mode so it cannot abort that successor.
-      const origin = { bindingGeneration: this.run.bindingGeneration(), localOnly: this.#localOnlyAbort };
+      const origin = {
+        bindingGeneration: this.run.bindingGeneration(),
+        localOnly: this.#localOnlyAbort,
+        suspendedRunIds: abandonedRunIds,
+      };
       void this.runEngine
         .settleSuspendedToolCallsAsDenied(suspendedToolCalls)
         .catch(error => this.emit({ type: 'error', error: getErrorFromUnknown(error) }))
@@ -3642,7 +3664,7 @@ export class Session<TState = unknown> {
    * claims it as soon as the gate releases, so a later abort of another run
    * cannot overwrite the origin this run's teardown is checked against.
    */
-  takeDeferredAbortOrigin(): { bindingGeneration: number; localOnly: boolean } | undefined {
+  takeDeferredAbortOrigin(): DeferredAbortOrigin | undefined {
     const origin = this.#deferredAbortOrigin;
     this.#deferredAbortOrigin = undefined;
     return origin;
@@ -3658,10 +3680,20 @@ export class Session<TState = unknown> {
    * run state. (The abort-requested flag is not a usable guard: the denial's
    * own resumed run resets it before settlement resolves.)
    */
-  completeDeferredAbort(origin?: { bindingGeneration: number; localOnly: boolean }): void {
-    if (origin && this.run.bindingGeneration() !== origin.bindingGeneration) return;
-    this.stream.abort({ localOnly: origin?.localOnly ?? this.#localOnlyAbort });
-    this.run.requestAbort();
+  completeDeferredAbort(origin?: DeferredAbortOrigin): void {
+    const sameBinding = !origin || this.run.bindingGeneration() === origin.bindingGeneration;
+    if (sameBinding) {
+      this.stream.abort({ localOnly: origin?.localOnly ?? this.#localOnlyAbort });
+      this.run.requestAbort();
+    }
+    // The abort denied these runs' parked suspensions, so no resume can reach them. Release
+    // them after the teardown, which can still write their snapshots, whatever binding the
+    // session holds now.
+    for (const runId of origin?.suspendedRunIds ?? []) {
+      this.machinery
+        .releaseSuspendedRun(runId)
+        .catch(error => this.emit({ type: 'error', error: getErrorFromUnknown(error) }));
+    }
   }
 
   /**

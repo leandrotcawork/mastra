@@ -9,6 +9,7 @@ import { AgentControllerChannels } from '../channels/agent-controller-channels';
 import { GatewayManager } from '../llm/model/gateways';
 import { defaultGateways } from '../llm/model/gateways/defaults';
 import type { MastraModelConfig } from '../llm/model/shared.types';
+import { AGENTIC_EXECUTION_WORKFLOW_ID, AGENTIC_LOOP_WORKFLOW_ID } from '../loop/loop-builder';
 import { Mastra } from '../mastra';
 import { TITLE_PINNED_THREAD_METADATA_KEY } from '../memory';
 import type { MastraMemory } from '../memory/memory';
@@ -407,6 +408,15 @@ export class AgentController<TState = {}> {
     session.setMachinery({
       getAgent: () => this.getCurrentAgent(session),
       getRunScope: runId => this.getMastra()?.__getRunScope(runId),
+      releaseSuspendedRun: async runId => {
+        const mastra = this.getMastra();
+        if (!mastra) return;
+        mastra.__unregisterInternalWorkflow(AGENTIC_LOOP_WORKFLOW_ID, runId);
+        const workflowsStore = await mastra.getStorage()?.getStore('workflows');
+        for (const workflowName of [AGENTIC_LOOP_WORKFLOW_ID, AGENTIC_EXECUTION_WORKFLOW_ID]) {
+          await workflowsStore?.deleteWorkflowRunById({ runId, workflowName });
+        }
+      },
       // History lets the runtime skip retained run parts that storage already
       // covers, so a fresh session never re-acts on finished runs.
       subscribeToThread: async ({ agent, resourceId, threadId, requestContext }) =>
